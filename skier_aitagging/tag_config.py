@@ -105,6 +105,120 @@ def _base_settings() -> TagSettings:
     )
 
 
+
+def _migrate_csv_schema(config_path: Path, template_path: Path) -> bool:
+    """Migrate existing CSV to include new columns and rows from template.
+    
+    This handles two scenarios:
+    1. Adding new columns (e.g., 'enabled', 'category') that were added to the template
+    2. Adding new tag rows that exist in template but not in user's CSV
+    
+    Returns True if migration was performed, False if no changes needed.
+    """
+    import tempfile
+    import os
+    
+    if not config_path.exists() or not template_path.exists():
+        return False
+    
+    # Read template to get canonical columns and all tag rows
+    template_headers = []
+    template_rows_by_tag = {}  # tag_name -> full row dict
+    try:
+        with template_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            template_headers = [h.strip() for h in (reader.fieldnames or [])]
+            for row in reader:
+                # Normalize keys
+                row = {k.strip(): v for k, v in row.items()}
+                tag_name = row.get("tag_name", "").strip()
+                if tag_name:
+                    template_rows_by_tag[tag_name.lower()] = row
+    except Exception as exc:
+        _log.warning("Failed to read template for migration: %s", exc)
+        return False
+    
+    # Read existing config
+    config_headers = []
+    config_rows = []
+    config_tag_names = set()
+    try:
+        with config_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            config_headers = [h.strip() for h in (reader.fieldnames or [])]
+            for row in reader:
+                # Normalize keys
+                row = {k.strip(): v for k, v in row.items()}
+                config_rows.append(row)
+                tag_name = row.get("tag_name", "").strip()
+                if tag_name:
+                    config_tag_names.add(tag_name.lower())
+    except Exception as exc:
+        _log.warning("Failed to read config for migration: %s", exc)
+        return False
+    
+    # Check if migration is needed
+    missing_columns = [h for h in template_headers if h not in config_headers]
+    missing_tags = [t for t in template_rows_by_tag if t not in config_tag_names]
+    
+    if not missing_columns and not missing_tags:
+        return False  # No migration needed
+    
+    _log.info("Migrating CSV schema: adding %d columns, %d tag rows", 
+              len(missing_columns), len(missing_tags))
+    
+    # Build new header list (preserve existing order, append new columns)
+    new_headers = config_headers + missing_columns
+    
+    # Update existing rows with default values for new columns
+    migrated_rows = []
+    for row in config_rows:
+        new_row = dict(row)
+        tag_name = row.get("tag_name", "").strip().lower()
+        template_row = template_rows_by_tag.get(tag_name, {})
+        
+        for col in missing_columns:
+            if col == "enabled":
+                new_row[col] = "TRUE"  # Default to enabled for backward compat
+            elif col == "category":
+                # Look up category from template
+                new_row[col] = template_row.get("category", "")
+            else:
+                # Use template default or empty
+                new_row[col] = template_row.get(col, "")
+        
+        migrated_rows.append(new_row)
+    
+    # Add missing tag rows from template
+    for tag_key in missing_tags:
+        template_row = template_rows_by_tag[tag_key]
+        # Create new row with all columns from template
+        new_row = {col: template_row.get(col, "") for col in new_headers}
+        migrated_rows.append(new_row)
+        _log.debug("Added new tag from template: %s", template_row.get("tag_name", tag_key))
+    
+    # Write atomically using tempfile
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".csv", dir=config_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=new_headers)
+                writer.writeheader()
+                writer.writerows(migrated_rows)
+            os.replace(tmp_path, config_path)
+            _log.info("CSV migration complete: %s", config_path)
+            return True
+        except Exception:
+            # Clean up temp file on error
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        _log.error("Failed to write migrated CSV: %s", exc)
+        return False
+
 class TagConfiguration:
     def __init__(
         self,
@@ -297,6 +411,11 @@ class TagConfiguration:
             else:
                 _log.info("Tag settings file %s was not found and no template available; using built-in defaults", config_path)
 
+
+        # Migrate existing config if it has missing columns or tags from template
+        template_path = plugin_root / _TEMPLATE_FILENAME
+        if config_path.exists() and template_path.exists():
+            _migrate_csv_schema(config_path, template_path)
         # If we now have a config file, parse it. Otherwise fall back to defaults.
         if config_path.exists():
             try:
